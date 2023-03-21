@@ -311,6 +311,10 @@ def solve_generic_einsum(parsed_vectors, a_var, b_var, name):
         - var
         - output var that contains the einsum result
     """
+    # TODO: This seems questionable at best.
+    if a_var.dtype != b_var.dtype:
+        a_var = mb.cast(x=a_var, dtype="fp32")
+        b_var = mb.cast(x=b_var, dtype="fp32")
 
     def _get_perm(src_axes, dst_axes):
         """
