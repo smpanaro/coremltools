@@ -13,6 +13,9 @@
 #import <fstream>
 #import <vector>
 
+#import <os/log.h>
+#import <os/signpost.h>
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-prototypes"
 
@@ -108,21 +111,59 @@ Model::Model(const std::string& urlStr, const std::string& computeUnits) {
             configuration.computeUnits = MLComputeUnitsAll;
         }
 
+        outputCache = [NSMutableDictionary new];
+
         // Create MLModel
         m_model = [MLModel modelWithContentsOfURL:compiledUrl configuration:configuration error:&error];
         Utils::handleError(error);
     }
 }
 
-py::dict Model::predict(const py::dict& input) const {
+py::dict Model::predict(const py::dict& input, const std::optional<py::dict>& inputOutputKeyMapping) const {
     @autoreleasepool {
+        os_log_t log = Utils::default_log();
         NSError *error = nil;
-        MLDictionaryFeatureProvider *inFeatures = Utils::dictToFeatures(input, &error);
+
+        // Populate input features from the cache.
+        NSDictionary<NSString *, NSString *> *nsKeyMapping = nil;
+        if (inputOutputKeyMapping.has_value()) {
+            nsKeyMapping = Utils::convertStringDictToObjC(inputOutputKeyMapping.value());
+        }
+        NSMutableDictionary<NSString *, MLMultiArray *> *extraFeatures = [NSMutableDictionary new];
+        [nsKeyMapping enumerateKeysAndObjectsUsingBlock:^(NSString * _Nonnull inputKey, NSString * _Nonnull outputKey, BOOL * _Nonnull stop) {
+            if (outputCache[outputKey] != nil) {
+                extraFeatures[inputKey] = outputCache[outputKey];
+            }
+        }];
+
+        os_signpost_id_t inputSignpostId = os_signpost_id_generate(log);
+        os_signpost_interval_begin(log, inputSignpostId, "Convert", "Convert Input");
+        MLDictionaryFeatureProvider *inFeatures = Utils::dictToFeatures(input, extraFeatures, &error);
         Utils::handleError(error);
+        os_signpost_interval_end(log, inputSignpostId, "Convert");
+
+        os_signpost_id_t predictionSignpostId = os_signpost_id_generate(log);
+        os_signpost_interval_begin(log, predictionSignpostId, "Predict");
         id<MLFeatureProvider> outFeatures = [m_model predictionFromFeatures:static_cast<MLDictionaryFeatureProvider * _Nonnull>(inFeatures)
                                                                       error:&error];
         Utils::handleError(error);
-        return Utils::featuresToDict(outFeatures);
+        os_signpost_interval_end(log, predictionSignpostId, "Predict");
+
+        // Update cache with new output values.
+        NSMutableSet<NSString *> *cachedOutputKeys = [NSMutableSet new];
+        [nsKeyMapping enumerateKeysAndObjectsUsingBlock:^(NSString * _Nonnull inputKey, NSString * _Nonnull outputKey, BOOL * _Nonnull stop) {
+            MLMultiArray *outFeature = [[outFeatures featureValueForName:outputKey] multiArrayValue];
+            if (outFeature != nil) {
+                outputCache[outputKey] = outFeature;
+                [cachedOutputKeys addObject:outputKey];
+            }
+        }];
+
+        os_signpost_id_t outputSignpostId = os_signpost_id_generate(log);
+        os_signpost_interval_begin(log, outputSignpostId, "Convert", "Convert Output");
+        py::dict res = Utils::featuresToDict(outFeatures, cachedOutputKeys);
+        os_signpost_interval_end(log, outputSignpostId, "Convert");
+        return res;
     }
 }
 
@@ -134,7 +175,7 @@ py::list Model::batchPredict(const py::list& batch) const {
       // Convert input to a BatchProvider
       NSMutableArray* array = [[NSMutableArray alloc] initWithCapacity: batch.size()];
       for(int i = 0; i < batch.size(); i++) {
-        MLDictionaryFeatureProvider* cur = Utils::dictToFeatures(batch[i], &error);
+        MLDictionaryFeatureProvider* cur = Utils::dictToFeatures(batch[i], @{}, &error);
         Utils::handleError(error);
         [array addObject: cur];
       }
@@ -148,7 +189,7 @@ py::list Model::batchPredict(const py::list& batch) const {
       // Convert predictions to output
       py::list ret;
       for (int i = 0; i < predictions.array.count; i++) {
-        ret.append(Utils::featuresToDict(predictions.array[i]));
+        ret.append(Utils::featuresToDict(predictions.array[i], nil));
       }
       return ret;
   }
@@ -205,7 +246,8 @@ PYBIND11_PLUGIN(libcoremlpython) {
 
     py::class_<Model>(m, "_MLModelProxy")
         .def(py::init<const std::string&, const std::string&>())
-        .def("predict", &Model::predict)
+        .def("predict", &Model::predict,
+            py::arg("features"), py::arg("input_output_key_mapping") = py::none())
         .def("batchPredict", &Model::batchPredict)
         .def("get_compiled_model_path", &Model::getCompiledModelPath)
         .def_static("auto_set_specification_version", &Model::autoSetSpecificationVersion)

@@ -23,6 +23,7 @@ namespace CoreML {
             MLModel *m_model = nil;
             NSURL *compiledUrl = nil;
             bool m_deleteCompiledModelOnExit;
+            NSMutableDictionary<NSString *, MLMultiArray *> *outputCache;
 
         public:
             static py::bytes autoSetSpecificationVersion(const py::bytes& modelBytes);
@@ -34,8 +35,8 @@ namespace CoreML {
             ~Model();
             explicit Model(const std::string& urlStr, const std::string& computeUnits);
 
-            py::dict predict(const py::dict& input) const;
-            py::list batchPredict(const py::list& batch) const;
+            py::dict predict(const py::dict &input, const std::optional<py::dict> &input_output_key_mapping) const;
+            py::list batchPredict(const py::list &batch) const;
 
             py::str getCompiledModelPath() const;
         };

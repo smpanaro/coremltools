@@ -533,7 +533,7 @@ class MLModel:
         return _deepcopy(self._spec)
 
 
-    def predict(self, data):
+    def predict(self, data, input_output_key_mapping=None):
         """
         Return predictions for the model.
 
@@ -545,6 +545,17 @@ class MLModel:
 
             The following dictionary values types are acceptable: list, array, numpy.ndarray, tensorflow.Tensor
             and torch.Tensor.
+
+        input_output_key_mapping: dict[str, str]
+            Dictionary that maps from a key of the model's input, to a key of the model's output.
+            Passing this parameter has three has three effects:
+              - The output data corresponding to the output key will be saved for the next call.
+              - The output key will not be present in the returned dictionary.
+              - If the input key is omitted from the data parameter, the prior call's output will be
+                used in its place.
+            This increases prediction performance, especially for large arrays.
+
+            Not supported for batch_predictions.
 
         Returns
         -------
@@ -566,8 +577,6 @@ class MLModel:
         def verify_and_convert_input_dict(d):
             self._verify_input_dict(d)
             self._convert_tensor_to_numpy(d)
-            # TODO: remove the following call when this is fixed: rdar://92239209
-            self._update_float16_multiarray_input_to_float32(d)
 
         if self.is_package and _is_macos() and _macos_version() < (12, 0):
             raise Exception(
@@ -576,7 +585,7 @@ class MLModel:
         MLModel._check_predict_data(data)
 
         if self.__proxy__:
-            return MLModel._get_predictions(self.__proxy__, verify_and_convert_input_dict, data)
+            return MLModel._get_predictions(self.__proxy__, verify_and_convert_input_dict, data, input_output_key_mapping)
         else:   # Error case
             if _macos_version() < (10, 13):
                 raise Exception(
@@ -625,10 +634,10 @@ class MLModel:
 
 
     @staticmethod
-    def _get_predictions(proxy, preprocess_method, data):
+    def _get_predictions(proxy, preprocess_method, data, input_output_key_mapping):
         if type(data) == dict:
             preprocess_method(data)
-            return proxy.predict(data)
+            return proxy.predict(data, input_output_key_mapping)
         else:
             assert type(data) == list
             for i in data:
@@ -729,12 +738,6 @@ class MLModel:
                 err_msg = "Provided key \"{}\", in the input dict, " \
                           "does not match any of the model input name(s), which are: {}"
                 raise KeyError(err_msg.format(given_input, ",".join(model_input_names)))
-
-    @staticmethod
-    def _update_float16_multiarray_input_to_float32(input_data: dict):
-        for k, v in input_data.items():
-            if isinstance(v, _np.ndarray) and v.dtype == _np.float16:
-                input_data[k] = v.astype(_np.float32)
 
     def _convert_tensor_to_numpy(self, input_dict):
         def convert(given_input):

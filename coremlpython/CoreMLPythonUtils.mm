@@ -11,6 +11,9 @@
 
 #import <Accelerate/Accelerate.h>
 
+#import <os/log.h>
+#import <os/signpost.h>
+
 #if PY_MAJOR_VERSION < 3
 
 #pragma clang diagnostic push
@@ -41,20 +44,47 @@ void Utils::handleError(NSError *error) {
     }
 }
 
-MLDictionaryFeatureProvider * Utils::dictToFeatures(const py::dict& dict, NSError * __autoreleasing *error) {
+os_log_t Utils::default_log() {
+    return os_log_create("com.apple.coremltools", OS_LOG_CATEGORY_POINTS_OF_INTEREST);
+}
+
+// Return a log for messages that should only be recorded when a performance tool
+// (ie Instruments) is attached.
+os_log_t Utils::dynamic_tracing_log() {
+    return os_log_create("com.apple.coremltools", OS_LOG_CATEGORY_DYNAMIC_TRACING);
+}
+
+MLDictionaryFeatureProvider * Utils::dictToFeatures(
+    const py::dict& dict,
+    NSDictionary<NSString *, NSObject *> *extraFeatures,
+    NSError * __autoreleasing *error) {
     NSError *localError;
     MLDictionaryFeatureProvider * feautreProvider;
 
     @autoreleasepool {
+        os_log_t log = Utils::default_log();
         NSMutableDictionary<NSString *, NSObject *> *inputDict = [[NSMutableDictionary<NSString *, NSObject *> alloc] init];
-        
+
         for (const auto element : dict) {
             std::string key = element.first.cast<std::string>();
             NSString *nsKey = [NSString stringWithUTF8String:key.c_str()];
+
+            os_signpost_id_t inputSignpostId = os_signpost_id_generate(log);
+            os_signpost_interval_begin(log, inputSignpostId, "Convert", "Feature: %s", key.c_str());
+
             id nsValue = Utils::convertValueToObjC(element.second);
             inputDict[nsKey] = nsValue;
+
+            os_signpost_interval_end(log, inputSignpostId, "Convert");
         }
-        
+
+        [extraFeatures enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSObject *value, BOOL *stop) {
+            if (inputDict[key] == nil) {
+                os_signpost_event_emit(log, os_signpost_id_generate(log), "Convert", "Add Cached Feature: %s", [key UTF8String]);
+                inputDict[key] = value;
+            }
+        }];
+
         feautreProvider = [[MLDictionaryFeatureProvider alloc] initWithDictionary:inputDict error:&localError];
     }
 
@@ -64,15 +94,26 @@ MLDictionaryFeatureProvider * Utils::dictToFeatures(const py::dict& dict, NSErro
     return feautreProvider;
 }
 
-py::dict Utils::featuresToDict(id<MLFeatureProvider> features) {
+py::dict Utils::featuresToDict(id<MLFeatureProvider> features, NSSet<NSString *> *skipFeatures) {
     @autoreleasepool {
+        os_log_t log = Utils::default_log();
         py::dict ret;
         NSSet<NSString *> *keys = [features featureNames];
         for (NSString *key in keys) {
+            if (skipFeatures != nil && [skipFeatures containsObject:key]) {
+                os_signpost_event_emit(log, os_signpost_id_generate(log), "Convert", "Skip Feature: %s", [key UTF8String]);
+                continue;
+            }
+
+            os_signpost_id_t inputSignpostId = os_signpost_id_generate(log);
+            os_signpost_interval_begin(log, inputSignpostId, "Convert", "Feature: %s", [key UTF8String]);
+
             MLFeatureValue *value = [features featureValueForName:key];
             py::str pyKey = py::str([key UTF8String]);
             py::object pyValue = convertValueToPython(value);
             ret[pyKey] = pyValue;
+
+            os_signpost_interval_end(log, inputSignpostId, "Convert");
         }
         return ret;
     }
@@ -364,39 +405,57 @@ MLFeatureValue * Utils::convertValueToObjC(const py::handle& handle) {
         try {
             int64_t val = handle.cast<int64_t>();
             return [MLFeatureValue featureValueWithInt64:val];
-        } catch(...) {}
+        } catch(std::runtime_error& e) {
+            py::print("Error in PyAnyInteger_Check: ");
+            py::print(e.what());
+        }
     }
     
     if (PyFloat_Check(handle.ptr())) {
         try {
             double val = handle.cast<double>();
             return [MLFeatureValue featureValueWithDouble:val];
-        } catch(...) {}
+        } catch(std::runtime_error& e) {
+            py::print("Error in PyFloat_Check: ");
+            py::print(e.what());
+        }
     }
     
     if (PyBytes_Check(handle.ptr()) || PyUnicode_Check(handle.ptr())) {
         try {
             std::string val = handle.cast<std::string>();
             return [MLFeatureValue featureValueWithString:[NSString stringWithUTF8String:val.c_str()]];
-        } catch(...) {}
+        } catch(std::runtime_error& e) {
+            py::print("Error in PyBytes_Check: ");
+            py::print(e.what());
+        }
     }
     
     if (PyDict_Check(handle.ptr())) {
         try {
             return convertValueToDictionary(handle);
-        } catch(...) {}
+        } catch(std::runtime_error& e) {
+            py::print("Error in PyDict_Check: ");
+            py::print(e.what());
+        }
     }
     
     if(PyList_Check(handle.ptr()) || PyTuple_Check(handle.ptr())) {
         try {
             return convertValueToSequence(handle);
-        } catch(...) {}
+        } catch(std::runtime_error& e) {
+            py::print("Error in PyList_Check: ");
+            py::print(e.what());
+        }
     }
 
     if(PyObject_CheckBuffer(handle.ptr())) {
         try {
             return convertValueToArray(handle);
-        } catch(...) {}
+        } catch(std::runtime_error& e) {
+            py::print("Error in PyObject_CheckBuffer: ");
+            py::print(e.what());
+        }
     }
     
     if (IsPILImage(handle)) {
@@ -428,8 +487,9 @@ static size_t sizeOfArrayElement(MLMultiArrayDataType type) {
     switch (type) {
         case MLMultiArrayDataTypeInt32:
             return sizeof(int32_t);
-        case MLMultiArrayDataTypeFloat32:
         case MLMultiArrayDataTypeFloat16:
+            return sizeof(np_float16_t);
+        case MLMultiArrayDataTypeFloat32:
             return sizeof(float);
         case MLMultiArrayDataTypeDouble:
             return sizeof(double);
@@ -444,13 +504,6 @@ py::object Utils::convertArrayValueToPython(MLMultiArray *value) {
         return py::none();
     }
     MLMultiArrayDataType type = value.dataType;
-    if (type == MLMultiArrayDataTypeFloat16) {
-        // Cast to fp32 because py:array doesn't support fp16.
-        // TODO: rdar://92239209 : return np.float16 instead of np.float32 when multiarray type is Float16
-        value = [MLMultiArray multiArrayByConcatenatingMultiArrays:@[value] alongAxis:0 dataType:MLMultiArrayDataTypeFloat32];
-        type = value.dataType;
-    }
-
     std::vector<size_t> shape = Utils::convertNSArrayToCpp(value.shape);
     std::vector<size_t> strides = Utils::convertNSArrayToCpp(value.strides);
 
@@ -464,6 +517,9 @@ py::object Utils::convertArrayValueToPython(MLMultiArray *value) {
         switch (type) {
             case MLMultiArrayDataTypeInt32:
                 array = py::array(shape, strides, reinterpret_cast<const int32_t *>(bytes));
+                break;
+            case MLMultiArrayDataTypeFloat16:
+                array = py::array(shape, strides, reinterpret_cast<const np_float16_t *>(bytes));
                 break;
             case MLMultiArrayDataTypeFloat32:
                 array = py::array(shape, strides, reinterpret_cast<const float *>(bytes));
@@ -501,6 +557,25 @@ py::object Utils::convertDictionaryValueToPython(NSDictionary<NSObject *,NSNumbe
         ret[pykey] = py::float_([value doubleValue]);
     }
     return std::move(ret);
+}
+
+NSDictionary<NSString *, NSString *>* Utils::convertStringDictToObjC(const py::dict &dict) {
+    NSMutableDictionary<NSString *, NSString *> *ret = [NSMutableDictionary new];
+    for (const auto element : dict) {
+        if (!py::isinstance<py::str>(element.first) && !py::isinstance<py::bytes>(element.first)) {
+            throw std::runtime_error("All keys in the dictionary must be strings.");
+        }
+        if (!py::isinstance<py::str>(element.second) && !py::isinstance<py::bytes>(element.second)) {
+            throw std::runtime_error("All values in the dictionary must be strings.");
+        }
+        std::string key = element.first.cast<std::string>();
+        NSString *nsKey = [NSString stringWithUTF8String:key.c_str()];
+
+        std::string value = element.second.cast<std::string>();
+        NSString *nsValue = [NSString stringWithUTF8String:value.c_str()];
+        ret[nsKey] = nsValue;
+    }
+    return ret;
 }
 
 py::object Utils::convertImageValueToPython(CVPixelBufferRef value) {
